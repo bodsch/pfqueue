@@ -5,12 +5,14 @@
 package pfq
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,9 @@ const (
 	// volatileStatusTTL is how long a non cacheable status is reused.
 	volatileStatusTTL = time.Second
 )
+
+// ErrNoMessage is returned for a message id that is not in the queue.
+var ErrNoMessage = errors.New("message does not exist")
 
 // SortField selects the list ordering.
 type SortField int
@@ -70,7 +75,8 @@ type Config struct {
 	Refresh       int // seconds between screen refreshes
 	RemoteHost    string
 	RemotePort    int
-	ConfigFrom    int // 1 = /etc, 2 = $HOME, 3 = both
+	ListenAddress string // socket frontend: host or host:port, "" = all interfaces
+	ConfigFrom    int    // 1 = /etc, 2 = $HOME, 3 = both
 
 	FrontendName  string
 	FrontendsPath string // kept for compatibility, frontends are built in
@@ -147,6 +153,7 @@ type Context struct {
 	mu          sync.Mutex
 	status      Status
 	queue       []*Message
+	byID        map[string]*Message // index into queue, first message per id
 	lastChanged time.Time
 
 	search     *regexp.Regexp
@@ -161,14 +168,10 @@ type Context struct {
 // New creates a library context.
 func New(conf Config, st Status, logger *log.Logger) *Context {
 	if logger == nil {
-		logger = log.New(discard{}, "", 0)
+		logger = log.New(io.Discard, "", 0)
 	}
 	return &Context{Conf: conf, Log: logger, status: st}
 }
-
-type discard struct{}
-
-func (discard) Write(p []byte) (int, error) { return len(p), nil }
 
 // Start selects and sets up the backend, starts the scanner and switches
 // to the initial queue (pfql_backend_start).
@@ -211,6 +214,11 @@ func (c *Context) Start() error {
 func (c *Context) StartWith(be backend.Backend) error {
 	c.be = be
 	c.Log.Printf("backend %s is OK", c.be.ID())
+	if be.Caps()&backend.CapEnvelope == 0 {
+		// -e / use_envelope=yes cannot apply; the frontend would otherwise
+		// label header addresses as envelope ones
+		c.UpdateStatus(func(s *Status) { s.UseEnvelope = false })
+	}
 
 	c.rescan = make(chan scanReq)
 	c.quit = make(chan struct{})
@@ -330,14 +338,7 @@ func (c *Context) Message(id string) (Message, bool) {
 	return Message{}, false
 }
 
-func (c *Context) findLocked(id string) *Message {
-	for _, m := range c.queue {
-		if m.ID == id {
-			return m
-		}
-	}
-	return nil
-}
+func (c *Context) findLocked(id string) *Message { return c.byID[id] }
 
 // RetrHeaders loads From/To/Subject of a message unless cached. It
 // reports whether the backend was asked.
@@ -395,7 +396,7 @@ func (c *Context) RetrStatus(id string) {
 func (c *Context) RetrBody(id string) ([]byte, error) {
 	m, ok := c.Message(id)
 	if !ok {
-		return nil, errors.New("message does not exist")
+		return nil, ErrNoMessage
 	}
 	return c.be.Body(m.entry(), BodyMax)
 }
@@ -509,8 +510,7 @@ func (c *Context) SetQueue(q int) error {
 	c.mu.Lock()
 	c.status.CurQueue = q
 	c.status.WorkTagged = false
-	c.queue = nil
-	c.lastChanged = time.Now()
+	c.setQueueLocked(nil)
 	c.mu.Unlock()
 	err := c.be.SetQueue(q)
 	c.scanMu.Unlock()
@@ -626,9 +626,22 @@ func (c *Context) replaceLocked(q []*Message) {
 		changed = q[i] != c.queue[i]
 	}
 	if changed {
-		c.queue = q
-		c.lastChanged = time.Now()
+		c.setQueueLocked(q)
 	}
+}
+
+// setQueueLocked installs q and rebuilds the id index. With duplicate ids
+// (a symlinked queue directory) the first message wins, as a linear
+// search would find it.
+func (c *Context) setQueueLocked(q []*Message) {
+	c.queue = q
+	c.byID = make(map[string]*Message, len(q))
+	for _, m := range q {
+		if _, dup := c.byID[m.ID]; !dup {
+			c.byID[m.ID] = m
+		}
+	}
+	c.lastChanged = time.Now()
 }
 
 func sortMessages(q []*Message, f SortField, desc bool) {
@@ -643,11 +656,11 @@ func sortMessages(q []*Message, f SortField, desc bool) {
 		}
 		return ""
 	}
-	sort.SliceStable(q, func(i, j int) bool {
+	slices.SortStableFunc(q, func(a, b *Message) int {
 		if desc {
-			return key(q[i]) > key(q[j])
+			return cmp.Compare(key(b), key(a))
 		}
-		return key(q[i]) < key(q[j])
+		return cmp.Compare(key(a), key(b))
 	})
 }
 
@@ -655,17 +668,22 @@ func sortMessages(q []*Message, f SortField, desc bool) {
 
 // ParseSearch splits an optional f:, t:, e: or s: prefix off expr.
 func ParseSearch(expr string) (string, int) {
-	switch {
-	case strings.HasPrefix(expr, "f:"):
-		return expr[2:], SearchFrom
-	case strings.HasPrefix(expr, "t:"):
-		return expr[2:], SearchTo
-	case strings.HasPrefix(expr, "e:"):
-		return expr[2:], SearchFrom | SearchTo
-	case strings.HasPrefix(expr, "s:"):
-		return expr[2:], SearchSubject
+	for _, p := range searchPrefixes {
+		if rest, ok := strings.CutPrefix(expr, p.prefix); ok {
+			return rest, p.mode
+		}
 	}
 	return expr, SearchAll
+}
+
+var searchPrefixes = []struct {
+	prefix string
+	mode   int
+}{
+	{"f:", SearchFrom},
+	{"t:", SearchTo},
+	{"e:", SearchFrom | SearchTo},
+	{"s:", SearchSubject},
 }
 
 // SetSearch compiles the search expression (with optional field prefix).

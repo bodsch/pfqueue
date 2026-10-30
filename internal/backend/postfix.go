@@ -22,6 +22,7 @@ const (
 	envelopeFrom   = "sender: "
 	envelopeTo     = "recipient: "
 	nullEnvSender  = "Null envelope sender"
+	contentsMark   = "*** MESSAGE CONTENTS"
 	deferNoReason  = "Deferred, no reason"
 	deferReasonKey = "reason="
 )
@@ -112,18 +113,23 @@ func (p *postfix) Scan(ctx context.Context, max int) ([]Entry, error) {
 func (p *postfix) catArgs(e Entry) []string { return p.cfgArgs("-q", e.ID) }
 
 func (p *postfix) Headers(e Entry, envelope bool) (Headers, error) {
+	if !ValidID(e.ID) {
+		return Headers{From: StrError, To: StrError}, ErrInvalidID
+	}
 	hp := newPostfixParser(envelope)
-	if err := readLines(hp.feed, p.postcat, p.catArgs(e)...); err != nil && !hp.done() {
+	if err := readLines(hp.feed, p.postcat, p.catArgs(e)...); err != nil && !hp.finished() {
 		return Headers{From: StrError, To: StrError}, err
 	}
 	return hp.result(), nil
 }
 
 func newPostfixParser(envelope bool) *headerParser {
+	hp := newHeaderParser(headerFrom, headerTo, nullEnvSender, 0)
 	if envelope {
-		return newHeaderParser(envelopeFrom, envelopeTo, nullEnvSender, 0)
+		hp = newHeaderParser(envelopeFrom, envelopeTo, nullEnvSender, 0)
 	}
-	return newHeaderParser(headerFrom, headerTo, nullEnvSender, 0)
+	hp.contentsMark = contentsMark
+	return hp
 }
 
 // decodeHeader decodes RFC 2047 encoded words; undecodable input is kept.
@@ -141,9 +147,7 @@ func decodeHeader(s string) string {
 func (p *postfix) Status(e Entry) (string, bool, error) {
 	switch int(p.curQueue.Load()) {
 	case QueueDeferred:
-		// the defer log lives in "defer" instead of "deferred"
-		path := strings.Replace(e.Path, "deferred", "defer", 1)
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(p.deferPath(e.Path))
 		if err != nil {
 			return deferNoReason, true, nil
 		}
@@ -167,11 +171,28 @@ func (p *postfix) Status(e Entry) (string, bool, error) {
 	return "", true, nil
 }
 
+// deferPath maps a message in the deferred queue to its defer log, which
+// lives under "defer" instead of "deferred". Only the queue directory
+// component is replaced, never a "deferred" elsewhere in the path.
+func (p *postfix) deferPath(path string) string {
+	rel, err := filepath.Rel(filepath.Join(p.queueDir, "deferred"), path)
+	if err != nil || !filepath.IsLocal(rel) {
+		return ""
+	}
+	return filepath.Join(p.queueDir, "defer", rel)
+}
+
 func (p *postfix) Body(e Entry, max int) ([]byte, error) {
+	if !ValidID(e.ID) {
+		return nil, ErrInvalidID
+	}
 	return readLimited(max, false, p.postcat, p.catArgs(e)...)
 }
 
 func (p *postfix) Action(id string, a Action) error {
+	if !ValidID(id) {
+		return ErrInvalidID
+	}
 	var o string
 	switch a {
 	case ActionDelete:
@@ -185,5 +206,5 @@ func (p *postfix) Action(id string, a Action) error {
 	default:
 		return ErrUnusable
 	}
-	return command(p.postsuper, p.cfgArgs(o, id)...).Run()
+	return run(p.postsuper, p.cfgArgs(o, id)...)
 }

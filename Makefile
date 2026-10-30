@@ -64,13 +64,15 @@ build: ## Build the binary into bin/.
 # than dropping the export above keeps the binaries static while letting the
 # tests run: without it, `go test -race` fails on Linux with
 # "-race requires cgo; enable cgo by setting CGO_ENABLED=1".
+# -timeout 3m: a hanging test fails with a stack dump that names it,
+# instead of blocking for go test's default of 10 minutes.
 .PHONY: test
 test: ## Run the test suite with the race detector (needs a C compiler).
-	CGO_ENABLED=1 $(GO) test -race -count=1 ./...
+	CGO_ENABLED=1 $(GO) test -race -count=1 -timeout 3m ./...
 
 .PHONY: cover
 cover: ## Run tests and write a coverage profile.
-	CGO_ENABLED=1 $(GO) test -race -count=1 -coverprofile=coverage.out ./...
+	CGO_ENABLED=1 $(GO) test -race -count=1 -timeout 3m -coverprofile=coverage.out ./...
 	$(GO) tool cover -func=coverage.out | tail -n 1
 
 .PHONY: bench

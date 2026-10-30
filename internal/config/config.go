@@ -6,7 +6,10 @@ package config
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,28 +21,53 @@ import (
 // SystemFile is the global configuration file.
 const SystemFile = "/etc/pfqueue.conf"
 
+// ErrUnsafe is returned for a configuration file that someone other than
+// root or the current user could have written.
+var ErrUnsafe = errors.New("writable by other users, ignored")
+
 // Load reads the system and the user configuration file, the latter
-// overriding the former, and records which ones were found.
-func Load(conf *pfq.Config, st *pfq.Status) {
+// overriding the former, and records which ones were found. Files that
+// cannot be read or are unsafe are skipped and reported in the error.
+func Load(conf *pfq.Config, st *pfq.Status) error {
+	user := ""
+	if home, err := os.UserHomeDir(); err == nil {
+		user = filepath.Join(home, ".pfqueue")
+	}
+	return load(conf, st, SystemFile, user)
+}
+
+func load(conf *pfq.Config, st *pfq.Status, system, user string) error {
 	conf.ConfigFrom = 0
-	if readFile(SystemFile, conf, st) {
+	ok, err1 := readFile(system, conf, st)
+	if ok {
 		conf.ConfigFrom |= 1
 	}
-	if home, err := os.UserHomeDir(); err == nil {
-		if readFile(filepath.Join(home, ".pfqueue"), conf, st) {
+	var err2 error
+	if user != "" {
+		if ok, err2 = readFile(user, conf, st); ok {
 			conf.ConfigFrom |= 2
 		}
 	}
+	return errors.Join(err1, err2)
 }
 
-func readFile(name string, conf *pfq.Config, st *pfq.Status) bool {
+// readFile applies the file name. A missing file is not an error.
+func readFile(name string, conf *pfq.Config, st *pfq.Status) (bool, error) {
 	f, err := os.Open(name)
 	if err != nil {
-		return false
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
 	}
 	defer func() { _ = f.Close() }() // read only, nothing to flush
+	// pfqueue runs as root and the file names the MTA tools it executes
+	// (mta_bin), so a file another user can write would hand them root.
+	if err := checkSafe(f); err != nil {
+		return false, fmt.Errorf("%s: %w", name, err)
+	}
 	Parse(f, conf, st)
-	return true
+	return true, nil
 }
 
 // Parse applies the options read from r.
@@ -110,5 +138,7 @@ func apply(opt, val string, conf *pfq.Config, st *pfq.Status) {
 		conf.RemoteHost = val
 	case "remote_port":
 		num(&conf.RemotePort)
+	case "listen_address":
+		conf.ListenAddress = val
 	}
 }

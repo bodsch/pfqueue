@@ -15,6 +15,13 @@ import (
 	"pfqueue/internal/proto"
 )
 
+// socketTimeout bounds a single request, so an unresponsive server cannot
+// freeze the frontend. A variable for tests.
+var socketTimeout = 30 * time.Second
+
+// maxRemoteQueues bounds the queue count announced by the server.
+const maxRemoteQueues = 64
+
 // socket talks to a remote pfqueue running the socket frontend.
 type socket struct {
 	mu     sync.Mutex
@@ -50,11 +57,14 @@ func (s *socket) Setup(c Config) error {
 	s.r = bufio.NewReader(conn)
 
 	n, err := s.requestInt(proto.CmdNumQ)
+	if err == nil && (n < 1 || n > maxRemoteQueues) {
+		err = fmt.Errorf("implausible queue count %d", n)
+	}
 	if err != nil {
 		_ = conn.Close() // the protocol error is what matters
 		return fmt.Errorf("%w: %v", ErrUnusable, err)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		name, err := s.request(fmt.Sprintf("%s %d", proto.CmdQName, i))
 		if err != nil {
 			name = "noname"
@@ -79,6 +89,9 @@ func (s *socket) Close() error {
 func (s *socket) request(cmd string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.conn.SetDeadline(time.Now().Add(socketTimeout)); err != nil {
+		return "", err
+	}
 	if _, err := fmt.Fprintf(s.conn, "%s\n", cmd); err != nil {
 		return "", err
 	}
@@ -140,6 +153,9 @@ func (s *socket) Scan(ctx context.Context, max int) ([]Entry, error) {
 }
 
 func (s *socket) field(cmd, id string) string {
+	if !ValidID(id) {
+		return StrError
+	}
 	v, err := s.request(cmd + " " + id)
 	if err != nil {
 		return StrError
@@ -162,8 +178,14 @@ func (s *socket) Status(e Entry) (string, bool, error) {
 }
 
 func (s *socket) Body(e Entry, max int) ([]byte, error) {
+	if !ValidID(e.ID) {
+		return nil, ErrInvalidID
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.conn.SetDeadline(time.Now().Add(socketTimeout)); err != nil {
+		return nil, err
+	}
 	if _, err := fmt.Fprintf(s.conn, "%s %s\n", proto.CmdBody, e.ID); err != nil {
 		return nil, err
 	}
@@ -183,21 +205,26 @@ func (s *socket) Body(e Entry, max int) ([]byte, error) {
 	if err != nil || n < 0 {
 		return nil, fmt.Errorf("bad body length %q", lenStr)
 	}
-	body := make([]byte, n)
+	// keep at most max bytes; the length comes from the server and must
+	// not decide how much memory is allocated
+	body := make([]byte, min(n, max))
 	if _, err := io.ReadFull(s.r, body); err != nil {
+		return nil, err
+	}
+	if _, err := io.CopyN(io.Discard, s.r, int64(n-len(body))); err != nil {
 		return nil, err
 	}
 	// trailing newline terminating the reply
 	if _, err := s.r.ReadString('\n'); err != nil {
 		return nil, err
 	}
-	if len(body) > max {
-		body = body[:max]
-	}
 	return body, nil
 }
 
 func (s *socket) Action(id string, a Action) error {
+	if !ValidID(id) {
+		return ErrInvalidID
+	}
 	var cmd string
 	switch a {
 	case ActionDelete:

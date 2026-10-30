@@ -12,7 +12,7 @@ import (
 	"pfqueue/internal/pfq"
 )
 
-// dialog draws a centered, bordered dialog window and returns its origin.
+// dialog draws a centred, bordered dialog window and returns its origin.
 func (u *UI) dialog(h, w int) (int, int) {
 	sw, sh := u.s.Size()
 	x, y := max((sw-w)/2, 0), max((sh-h)/2, 0)
@@ -41,9 +41,9 @@ func (u *UI) askSort() (pfq.SortField, bool, bool) {
 		"Choose sort field:",
 		"",
 		"0: unsorted",
-		"1: from    (4 descendent)",
-		"2: to      (5 descendent)",
-		"3: subject (6 descendent)",
+		"1: from    (4 descending)",
+		"2: to      (5 descending)",
+		"3: subject (6 descending)",
 	}
 	ev := u.waitKey(func() {
 		x, y := u.dialog(8, 50)
@@ -173,7 +173,7 @@ const helpText1 = `  Messages and action keys:
   T) Search and tag messages
   c) Toggle confirmation request
   -) Suspend/resume queue scanning
-  +) Toggle colors on/off
+  +) Toggle colours on/off
   ?) This help
   q) Quit`
 

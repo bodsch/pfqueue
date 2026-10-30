@@ -26,9 +26,11 @@ pfqueue [-ehvn] [-q queue_num] [-m max_msg]
         [-f ncurses|socket] [-F frontends_path]
         [-s autorefresh_seconds] [-l limit_seconds] [-d scan_delay]
         [-p executables_path] [-c config_path] [-r remote_host]
+        [-L listen_address]
 ```
 
-pfqueue must be run as root.
+pfqueue must be run as root (`-h` and `-v` work without). Numeric
+options must be numbers; out-of-range values are clamped.
 
 | Option          | Description                                                                                     |
 |-----------------|-------------------------------------------------------------------------------------------------|
@@ -40,10 +42,11 @@ pfqueue must be run as root.
 | `-d seconds`    | Delay between queue scans (default 1)                                                           |
 | `-l seconds`    | Time limit for a single queue scan (1–300, default unlimited); results may be incomplete        |
 | `-e`            | Read From/To from the envelope instead of the headers (postfix only)                            |
-| `-n`            | Disable colors                                                                                  |
+| `-n`            | Disable colours                                                                                 |
 | `-p path`       | Directory containing the MTA executables (`postcat`, `postsuper`, `postconf`, `exim`, …)        |
 | `-c config`     | Custom MTA configuration: a directory for postfix, a file for exim                              |
 | `-r host[:port]`| Remote host for the socket backend                                                              |
+| `-L host[:port]`| Address the socket frontend listens on (default: all interfaces, port `remote_port`)           |
 | `-B`, `-F`      | Accepted for compatibility, ignored (backends and frontends are built in)                       |
 | `-v`, `-h`      | Show version / usage                                                                            |
 
@@ -55,7 +58,7 @@ Exit codes: 0 ok, 253 (-3) not root, 252 (-4) backend cannot be started,
 ```
  Queue: 'deferred', 30 messages, 2 tagged, unsorted          ATCSB   <- header
  ID                 From                      To
- 4AB001C01          Sender <s@example.org>    Empfänger <r@example.com>
+ 4AB001C01          Sender <s@example.org>    Recipient <r@example.com>
  ...                                                                  <- message list
 ┌─Message (from headers)─────────────────────────────────────────────┐
 │Message: 4AB001C01                                                  │
@@ -69,7 +72,7 @@ Exit codes: 0 ok, 253 (-3) not root, 252 (-4) backend cannot be started,
 The flags at the right of the header are shown reversed when active:
 **A** auto-work-on-tagged, **T** work-on-tagged, **C** ask for confirmation,
 **S** queue scanning, **B** automatic body display. Tagged messages are shown
-in bold (yellow with colors).
+in bold (yellow with colours).
 
 ## Key bindings
 
@@ -143,7 +146,7 @@ page, `g`/`Home` and `G`/`End` jump to start/end, `q`/`Esc` close.
 | `S`      | Sort: 0 unsorted, 1/2/3 by from/to/subject, 4/5/6 descending |
 | `e`      | Toggle From/To from envelope or headers (postfix only)       |
 | `-`      | Suspend/resume queue scanning (freeze the list)              |
-| `+`      | Toggle colors                                                |
+| `+`      | Toggle colours                                               |
 | `Ctrl-L` | Redraw the screen                                            |
 | `?`      | Help (any key: next page, `q`: close)                        |
 | `q`      | Quit (also `Ctrl-C`)                                         |
@@ -157,6 +160,12 @@ At startup `/etc/pfqueue.conf` and then `~/.pfqueue` are read; the latter
 overrides the former, command line options override both. Lines have the
 form `option=value` (whitespace is ignored), lines starting with `#` are
 comments.
+
+Since pfqueue runs as root and `mta_bin` names the programs it executes, a
+configuration file is ignored (with a warning) unless it is owned by root
+or the user running pfqueue and is not writable by group or others. Under
+`sudo` with `HOME` kept, a `~/.pfqueue` owned by the invoking user is
+therefore skipped.
 
 | Option           | Same as | Description                                   |
 |------------------|---------|-----------------------------------------------|
@@ -173,6 +182,7 @@ comments.
 | `use_colors`     | `-n`    | `yes` / `no`                                  |
 | `remote_host`    | `-r`    | Host for the socket backend                   |
 | `remote_port`    |         | TCP port of the socket protocol (default 20000) |
+| `listen_address` | `-L`    | Listen address of the socket frontend         |
 | `backends_path`, `frontends_path` | | Accepted, ignored                  |
 
 Example:
@@ -191,6 +201,18 @@ Run `pfqueue -f socket` on the mail server (listens on TCP port 20000,
 `-r host:port`) on the client. The protocol has no authentication; only
 expose it on trusted networks.
 
+By default the server listens on all interfaces. Restrict it with `-L` or
+`listen_address`, e.g. `-L 127.0.0.1` (reach it through an SSH tunnel:
+`ssh -L 20000:127.0.0.1:20000 mailhost`) or `-L 10.0.0.5:2525` for one
+internal interface on another port. A port given here overrides
+`remote_port`.
+
+The server serves at most 32 clients at a time, drops clients sending a
+request line longer than 1 KiB, and keeps every reply on one line (header
+values containing line breaks are flattened). All clients share one queue
+selection. The client validates message ids, caps body transfers at
+20 KiB, and gives up on a request after 30 seconds.
+
 ## Layout
 
 | Path               | Content                                         |
@@ -203,7 +225,7 @@ expose it on trusted networks.
 | `internal/server`  | Socket frontend                                 |
 | `internal/proto`   | Socket protocol constants                       |
 
-## Differences to the C version
+## Differences from the C version
 
 - Postfix 1.x is no longer supported; the `postfix1` backend was removed.
 - Backends and frontends are compiled in instead of loaded with `dlopen()`.
@@ -223,3 +245,8 @@ expose it on trusted networks.
   protocol handles multi-line bodies, the exim backend only scans
   `<spool>/input`.
 - The socket frontend serves several clients concurrently.
+- Message ids are checked before they are passed to `postsuper`, `postcat`
+  or `exim` (letters, digits and `-`; no leading `-`, not `ALL`).
+- Every run of an MTA tool is limited to 30 seconds, and header reading
+  stops at the end of the headers, so a `Subject:` line in the body of a
+  message without a subject is not shown as its subject.

@@ -14,7 +14,9 @@ type Msg struct {
 	ID, From, To, Subject, Body string
 }
 
-// Backend keeps its queues in memory and records actions.
+// Backend keeps its queues in memory and records actions. It rejects
+// what the real backends reject (a missing queue, an invalid id), so a
+// test cannot pass on input production would refuse; keep it that way.
 type Backend struct {
 	mu      sync.Mutex
 	Queues  [][]Msg
@@ -37,6 +39,9 @@ func (b *Backend) Status(backend.Entry) (string, bool, error) { return "Fake", t
 func (b *Backend) SetQueue(q int) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if q < 0 || q >= len(b.Queues) {
+		return backend.ErrUnusable
+	}
 	b.cur = q
 	return nil
 }
@@ -97,6 +102,9 @@ func (b *Backend) Body(e backend.Entry, max int) ([]byte, error) {
 }
 
 func (b *Backend) Action(id string, a backend.Action) error {
+	if !backend.ValidID(id) {
+		return backend.ErrInvalidID
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.Actions = append(b.Actions, a.String()+" "+id)

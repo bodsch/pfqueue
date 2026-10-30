@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // APIVersion mirrors PFQ_API_VERSION of the C backends.
@@ -62,6 +63,30 @@ const (
 
 // ErrUnusable is returned by Setup when the MTA is not available.
 var ErrUnusable = errors.New("backend unusable")
+
+// ErrInvalidID is returned for a message id that is not a plausible queue
+// id. Ids are passed as arguments to the MTA tools and over the socket
+// protocol, so they must be checked first.
+var ErrInvalidID = errors.New("invalid message id")
+
+// maxIDLen is far above the longest postfix (long queue id) or exim id.
+const maxIDLen = 64
+
+// ValidID reports whether id may be passed to an MTA tool or a remote
+// server. Postfix and exim ids consist of letters, digits and '-'. An id
+// starting with '-' would be read as an option, "-" makes postsuper read
+// ids from stdin and "ALL" makes it act on the whole queue; a newline
+// would inject a second command into the socket protocol.
+func ValidID(id string) bool {
+	if id == "" || len(id) > maxIDLen || id[0] == '-' || id == "ALL" {
+		return false
+	}
+	return strings.IndexFunc(id, func(c rune) bool { return !idChar(c) }) < 0
+}
+
+func idChar(c rune) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || c == '-'
+}
 
 // Entry is a message found while scanning a queue.
 type Entry struct {

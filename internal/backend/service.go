@@ -9,6 +9,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+)
+
+// cmdTimeout bounds every run of an MTA tool, so a hanging postcat or
+// exim cannot freeze the scanner or the screen. A variable for tests.
+var cmdTimeout = 30 * time.Second
+
+const (
+	// maxDigDepth bounds the queue directory recursion. Postfix hashes at
+	// most a few levels deep; the limit stops a symlink loop.
+	maxDigDepth = 8
 )
 
 // digDir walks base recursively (following symlinked directories, skipping
@@ -16,9 +27,9 @@ import (
 // entries. It stops early when ctx is done and returns what it found.
 func digDir(ctx context.Context, base string, max int, accept func(name string) (id string, ok bool)) []Entry {
 	var out []Entry
-	var dig func(dir string)
-	dig = func(dir string) {
-		if len(out) >= max || ctx.Err() != nil {
+	var dig func(dir string, depth int)
+	dig = func(dir string, depth int) {
+		if len(out) >= max || depth > maxDigDepth || ctx.Err() != nil {
 			return
 		}
 		ents, err := os.ReadDir(dir)
@@ -44,7 +55,7 @@ func digDir(ctx context.Context, base string, max int, accept func(name string) 
 			}
 			switch {
 			case mode.IsDir():
-				dig(full)
+				dig(full, depth+1)
 			case mode.IsRegular():
 				if id, ok := accept(name); ok {
 					out = append(out, Entry{ID: id, Path: full})
@@ -52,20 +63,48 @@ func digDir(ctx context.Context, base string, max int, accept func(name string) 
 			}
 		}
 	}
-	dig(base)
+	dig(base, 0)
 	return out
 }
 
-// command builds an exec.Cmd with stderr discarded (like "2>/dev/null").
-func command(name string, args ...string) *exec.Cmd {
-	cmd := exec.Command(name, args...)
-	cmd.Stderr = nil
-	return cmd
+// command builds an exec.Cmd that is killed after cmdTimeout. Stderr is
+// discarded (like "2>/dev/null"). The caller must call the returned
+// cancel function once the command has finished.
+func command(name string, args ...string) (*exec.Cmd, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	cmd := exec.CommandContext(ctx, name, args...)
+	// do not wait for grandchildren holding stdout open after a kill
+	cmd.WaitDelay = time.Second
+	return cmd, cancel
+}
+
+// run runs a command and waits for it to finish.
+func run(name string, args ...string) error {
+	cmd, cancel := command(name, args...)
+	defer cancel()
+	return cmd.Run()
+}
+
+// stdoutPipe returns the command's stdout. On timeout the pipe is closed
+// as well as the process killed: a child that inherited stdout would
+// otherwise keep the read, and with it the caller, blocked after the kill.
+func stdoutPipe(cmd *exec.Cmd) (io.ReadCloser, error) {
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Cancel = func() error {
+		_ = stdout.Close() // unblocks the reader
+		return cmd.Process.Kill()
+	}
+	return stdout, nil
 }
 
 // firstLine runs a command and returns the first line of its output.
 func firstLine(name string, args ...string) (string, error) {
-	out, err := command(name, args...).Output()
+	cmd, cancel := command(name, args...)
+	defer cancel()
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}
@@ -76,8 +115,9 @@ func firstLine(name string, args ...string) (string, error) {
 // readLines runs a command and calls fn for each output line until fn
 // returns false. The process is killed if it is not fully consumed.
 func readLines(fn func(line string) bool, name string, args ...string) error {
-	cmd := command(name, args...)
-	stdout, err := cmd.StdoutPipe()
+	cmd, cancel := command(name, args...)
+	defer cancel()
+	stdout, err := stdoutPipe(cmd)
 	if err != nil {
 		return err
 	}
@@ -93,10 +133,13 @@ func readLines(fn func(line string) bool, name string, args ...string) error {
 			break
 		}
 	}
-	if stopped {
+	// Kill on an early stop and also on a scanner error (a line longer
+	// than the buffer): the process would otherwise block on a full pipe
+	// and Wait would never return.
+	if serr := sc.Err(); stopped || serr != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		return nil
+		return serr
 	}
 	return cmd.Wait()
 }
@@ -104,8 +147,9 @@ func readLines(fn func(line string) bool, name string, args ...string) error {
 // readLimited runs a command and returns at most max bytes of its output,
 // optionally skipping the first output line.
 func readLimited(max int, skipFirstLine bool, name string, args ...string) ([]byte, error) {
-	cmd := command(name, args...)
-	stdout, err := cmd.StdoutPipe()
+	cmd, cancel := command(name, args...)
+	defer cancel()
+	stdout, err := stdoutPipe(cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -116,13 +160,10 @@ func readLimited(max int, skipFirstLine bool, name string, args ...string) ([]by
 	if skipFirstLine {
 		_, _ = r.ReadString('\n')
 	}
-	buf, rerr := io.ReadAll(io.LimitReader(r, int64(max)))
+	buf, err := io.ReadAll(io.LimitReader(r, int64(max)))
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
-	if rerr != nil {
-		return buf, rerr
-	}
-	return buf, nil
+	return buf, err
 }
 
 // lookFor returns the remainder of the first line starting with prefix.
@@ -144,6 +185,13 @@ type headerParser struct {
 	skip                       int
 	h                          Headers
 	gotFrom, gotTo, gotSubj    bool
+
+	// contentsMark, if set, starts the message contents; the first empty
+	// line after it ends the headers, so a "Subject:" in the body of a
+	// message without one is not taken for the header.
+	contentsMark string
+	inContents   bool
+	ended        bool
 }
 
 func newHeaderParser(fromKey, toKey, nullSender string, skip int) *headerParser {
@@ -155,6 +203,16 @@ func newHeaderParser(fromKey, toKey, nullSender string, skip int) *headerParser 
 
 // feed processes one line and reports whether more input is wanted.
 func (p *headerParser) feed(line string) bool {
+	if p.contentsMark != "" {
+		if strings.HasPrefix(line, p.contentsMark) {
+			p.inContents = true
+			return true
+		}
+		if p.inContents && line == "" {
+			p.ended = true
+			return false
+		}
+	}
 	if len(line) < p.skip {
 		return true
 	}
@@ -184,6 +242,10 @@ func (p *headerParser) feed(line string) bool {
 }
 
 func (p *headerParser) done() bool { return p.gotFrom && p.gotTo && p.gotSubj }
+
+// finished reports whether the parser needs no more input: every field
+// was found or the end of the headers was reached.
+func (p *headerParser) finished() bool { return p.done() || p.ended }
 
 func (p *headerParser) result() Headers {
 	h := p.h

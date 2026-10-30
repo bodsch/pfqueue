@@ -90,14 +90,20 @@ func (x *exim) Scan(ctx context.Context, max int) ([]Entry, error) {
 }
 
 func (x *exim) Headers(e Entry, _ bool) (Headers, error) {
+	if !ValidID(e.ID) {
+		return Headers{From: StrError, To: StrError}, ErrInvalidID
+	}
 	hp := newHeaderParser(headerFrom, headerTo, "Null sender", eximHeaderSkip)
-	if err := readLines(hp.feed, x.cmd, x.args("-Mvh", e.ID)...); err != nil && !hp.done() {
+	if err := readLines(hp.feed, x.cmd, x.args("-Mvh", e.ID)...); err != nil && !hp.finished() {
 		return Headers{From: StrError, To: StrError}, err
 	}
 	return hp.result(), nil
 }
 
 func (x *exim) Status(e Entry) (string, bool, error) {
+	if !ValidID(e.ID) {
+		return StrError, false, ErrInvalidID
+	}
 	status := "Active"
 	err := readLines(func(line string) bool {
 		if strings.HasPrefix(line, "-frozen") {
@@ -107,17 +113,23 @@ func (x *exim) Status(e Entry) (string, bool, error) {
 		return true
 	}, x.cmd, x.args("-Mvh", e.ID)...)
 	if err != nil {
-		return "cant popen", false, err
+		return "Cannot run exim", false, err
 	}
 	return status, false, nil
 }
 
 func (x *exim) Body(e Entry, max int) ([]byte, error) {
+	if !ValidID(e.ID) {
+		return nil, ErrInvalidID
+	}
 	// the first line of -Mvb output is the spool file name
 	return readLimited(max, true, x.cmd, x.args("-Mvb", e.ID)...)
 }
 
 func (x *exim) Action(id string, a Action) error {
+	if !ValidID(id) {
+		return ErrInvalidID
+	}
 	var o string
 	switch a {
 	case ActionDelete:
@@ -131,5 +143,5 @@ func (x *exim) Action(id string, a Action) error {
 	default:
 		return ErrUnusable
 	}
-	return command(x.cmd, x.args(o, id)...).Run()
+	return run(x.cmd, x.args(o, id)...)
 }

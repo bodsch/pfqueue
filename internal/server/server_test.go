@@ -1,7 +1,7 @@
 package server
 
 import (
-	"context"
+	"io"
 	"log"
 	"net"
 	"slices"
@@ -34,10 +34,9 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- New(lib, log.New(discard{}, "", 0)).Serve(ctx, ln) }()
+	go func() { serveErr <- New(lib, log.New(io.Discard, "", 0)).Serve(ctx, ln) }()
 	// runs after the deferred cancel()
 	t.Cleanup(func() {
 		if err := <-serveErr; err != nil {
@@ -90,7 +89,3 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("queue 1 = %v", entries)
 	}
 }
-
-type discard struct{}
-
-func (discard) Write(p []byte) (int, error) { return len(p), nil }

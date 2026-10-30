@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"pfqueue/internal/config"
@@ -39,7 +40,8 @@ func usage() {
 		"       [-b postfix2|exim|socket] [-B backends_path]\n" +
 		"       [-f ncurses|socket] [-F frontends_path]\n" +
 		"       [-s autorefresh_seconds] [-l limit_seconds] [-d scan_delay]\n" +
-		"       [-p executables_path] [-c config_path] [-r remote_host]\n")
+		"       [-p executables_path] [-c config_path] [-r remote_host]\n" +
+		"       [-L listen_address]\n")
 }
 
 func main() { os.Exit(run(os.Args[1:])) }
@@ -47,6 +49,24 @@ func main() { os.Exit(run(os.Args[1:])) }
 func clamp(v, lo, hi int) int { return max(lo, min(v, hi)) }
 
 func run(args []string) int {
+	opts, _, err := getopt(args, optSpec)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pfqueue: %v\n", err)
+		usage()
+		return 1
+	}
+	// help and version need no privileges
+	for _, o := range opts {
+		switch o.name {
+		case 'h':
+			usage()
+			return 0
+		case 'v':
+			version()
+			return 0
+		}
+	}
+
 	if os.Getuid() != 0 {
 		fmt.Fprintln(os.Stderr, "You need to be root to use pfqueue, sorry")
 		return exitNotRoot
@@ -54,52 +74,13 @@ func run(args []string) int {
 
 	conf := pfq.DefaultConfig()
 	st := pfq.DefaultStatus()
-	config.Load(&conf, &st)
-
-	opts, _, err := getopt(args, "p:c:r:B:F:b:f:q:s:m:l:d:ehvn")
-	if err != nil {
+	if err := config.Load(&conf, &st); err != nil {
+		fmt.Fprintf(os.Stderr, "pfqueue: config: %v\n", err)
+	}
+	if err := applyOptions(opts, &conf, &st); err != nil {
 		fmt.Fprintf(os.Stderr, "pfqueue: %v\n", err)
 		usage()
 		return 1
-	}
-	for _, o := range opts {
-		n, _ := strconv.Atoi(o.arg)
-		switch o.name {
-		case 'p':
-			conf.BackendProgs = o.arg
-		case 'c':
-			conf.BackendConfig = o.arg
-		case 'r':
-			conf.RemoteHost = o.arg
-		case 'B':
-			conf.BackendsPath = o.arg
-		case 'F':
-			conf.FrontendsPath = o.arg
-		case 'b':
-			conf.BackendName = o.arg
-		case 'f':
-			conf.FrontendName = o.arg
-		case 'q':
-			conf.InitialQueue = pfq.MapQueueArg(n)
-		case 'h':
-			usage()
-			return 0
-		case 'v':
-			version()
-			return 0
-		case 'm':
-			conf.MaxMessages = max(n, 5)
-		case 's':
-			conf.Refresh = clamp(n, 1, 300)
-		case 'l':
-			conf.ScanLimit = clamp(n, 1, 300)
-		case 'd':
-			conf.ScanDelay = max(n, 1)
-		case 'e':
-			st.UseEnvelope = true
-		case 'n':
-			st.UseColors = false
-		}
 	}
 
 	switch conf.FrontendName {
@@ -122,7 +103,7 @@ func run(args []string) int {
 	if conf.FrontendName == "socket" {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		addr := net.JoinHostPort("", strconv.Itoa(conf.RemotePort))
+		addr := listenAddr(conf.ListenAddress, conf.RemotePort)
 		logger.Printf("socket frontend listening on %s", addr)
 		if err := server.New(c, logger).ListenAndServe(ctx, addr); err != nil {
 			fmt.Fprintf(os.Stderr, "pfqueue: cannot start frontend: %v\n", err)
@@ -138,6 +119,69 @@ func run(args []string) int {
 	}
 	return 0
 }
+
+// applyOptions applies the command line options to conf and st. Numeric
+// arguments must be numbers; out of range values are clamped.
+func applyOptions(opts []option, conf *pfq.Config, st *pfq.Status) error {
+	for _, o := range opts {
+		n := 0
+		if strings.ContainsRune(numericOpts, rune(o.name)) {
+			var err error
+			if n, err = strconv.Atoi(o.arg); err != nil {
+				return fmt.Errorf("option -%c: %q is not a number", o.name, o.arg)
+			}
+		}
+		switch o.name {
+		case 'p':
+			conf.BackendProgs = o.arg
+		case 'c':
+			conf.BackendConfig = o.arg
+		case 'r':
+			conf.RemoteHost = o.arg
+		case 'L':
+			conf.ListenAddress = o.arg
+		case 'B':
+			conf.BackendsPath = o.arg
+		case 'F':
+			conf.FrontendsPath = o.arg
+		case 'b':
+			conf.BackendName = o.arg
+		case 'f':
+			conf.FrontendName = o.arg
+		case 'q':
+			conf.InitialQueue = pfq.MapQueueArg(n)
+		case 'm':
+			conf.MaxMessages = max(n, 5)
+		case 's':
+			conf.Refresh = clamp(n, 1, 300)
+		case 'l':
+			conf.ScanLimit = clamp(n, 1, 300)
+		case 'd':
+			conf.ScanDelay = max(n, 1)
+		case 'e':
+			st.UseEnvelope = true
+		case 'n':
+			st.UseColors = false
+		}
+	}
+	return nil
+}
+
+// optSpec lists the options in getopt(3) syntax.
+const optSpec = "p:c:r:L:B:F:b:f:q:s:m:l:d:ehvn"
+
+// listenAddr returns the address the socket frontend listens on. addr is
+// empty (all interfaces), a host or IP address, or host:port; without a
+// port, port is used.
+func listenAddr(addr string, port int) string {
+	if _, _, err := net.SplitHostPort(addr); err == nil {
+		return addr
+	}
+	return net.JoinHostPort(strings.Trim(addr, "[]"), strconv.Itoa(port))
+}
+
+// numericOpts are the options taking a number.
+const numericOpts = "qmsld"
 
 // newLogger logs to syslog (LOG_USER|LOG_ERR, like the C version) and,
 // for the headless socket frontend, also to stderr.

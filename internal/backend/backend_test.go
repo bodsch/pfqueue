@@ -24,7 +24,7 @@ body
 `
 
 func parse(hp *headerParser, out string) Headers {
-	for _, l := range strings.Split(out, "\n") {
+	for l := range strings.SplitSeq(out, "\n") {
 		if !hp.feed(l) {
 			break
 		}
@@ -107,6 +107,7 @@ func TestPostfixDeferStatus(t *testing.T) {
 
 	p := newPostfix()
 	p.version = pfVersion22
+	p.queueDir = dir
 	e := Entry{ID: "ABC", Path: filepath.Join(dir, "deferred", "A", "ABC")}
 	if st, _, _ := p.Status(e); st != "connect to mx: Connection refused" {
 		t.Fatalf("status = %q", st)
