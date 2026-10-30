@@ -38,6 +38,10 @@ on:
     paths-ignore:
       - "README.md"
 
+concurrency:
+  group: pfqueue_ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     name: verify
