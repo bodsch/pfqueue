@@ -109,5 +109,9 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
           else
-            gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS --verify-tag --title "$TAG" --generate-notes
+            # A tag with a suffix (1.0.0-rc, 1.1.0-beta.2) is a prerelease,
+            # so that it does not become the "Latest" release.
+            pre=""
+            case "$TAG" in *-*) pre="--prerelease" ;; esac
+            gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS --verify-tag --title "$TAG" --generate-notes $pre
           fi
